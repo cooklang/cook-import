@@ -7,6 +7,7 @@ on:
 
 jobs:
   build_linux:
+    if: ${{ false }}
     name: Build Linux binary
     runs-on: ubuntu-latest
     env:
@@ -61,9 +62,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   build_macos:
-    if: ${{ false }}
     name: Build macOS binary
-    runs-on: macos-11
+    runs-on: macos-10.15
     env:
       # SIGNING_AUTH: ${{ secrets.SIGNING_AUTH }}
       # NOTARIZATION_USER: ${{ secrets.NOTARIZATION_USER }}
@@ -72,7 +72,7 @@ jobs:
       # # We need the official Python, because the GA ones only support newer macOS versions
       # # The deployment target is picked up by the Python build tools automatically
       # # If updated, make sure to also set LSMinimumSystemVersion in SABnzbd.spec
-      PYTHON_VERSION: "3.10.0"
+      PYTHON_VERSION: "3.10.2"
       POETRY_VERSION: "1.1.11"
       MACOSX_DEPLOYMENT_TARGET: "10.9"
       # We need to force compile for universal2 support
@@ -90,16 +90,52 @@ jobs:
         if: steps.cache-python-download.outputs.cache-hit != 'true'
         run: curl https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-macos11.pkg -o ~/python.pkg
       - name: Install Python
-        run: sudo installer -pkg ~/python.pkg -target /
-      - name: Run image
-        uses: abatilo/actions-poetry@v2.0.0
+        run: |
+          sudo installer -pkg ~/python.pkg -target /
+          unlink /usr/local/bin/python
+          ln -s /usr/local/bin/python3 /usr/local/bin/python
+      - name: Cache Python virtualenv
+        uses: syphar/restore-virtualenv@v1.2
+        id: cache-virtualenv
         with:
-          poetry-version: ${{ env.POETRY_VERSION }}
-      - name: View poetry --help
-        run: poetry --help
+          custom_cache_key_element: "release"
+          requirement_files: |
+            requirements.txt
+            PKG-INFO
+      - name: Install Python dependencies
+        # We have to manually install a few packages:
+        # 1.  cffi will pick up the single-arch libffi from Homebrew, while Apple provides universal2-version
+        #     of libffi with XCode. So we forcefully have to remove the Homebrew one.
+        # 2.  Because building cryptography is hard, and we cannot force pip to fetch universal2 version we
+        #     first install the x86 version (and it's dependencies) and then manually fetch the universal2 build
+        #     https://github.com/pyca/cryptography/issues/5918
+        # 3.  We need to build the PyInstaller bootloader from sources:
+        #     https://github.com/pyinstaller/pyinstaller/issues/6235
+        if: steps.cache-virtualenv.outputs.cache-hit != 'true'
+        run: |
+          python3 --version
+          pip3 install --upgrade pip wheel
 
-      - name: Install dependencies
-        run: poetry install
+          brew uninstall libffi --ignore-dependencies
+          ARCHFLAGS="-arch x86_64 -arch arm64" pip3 install --upgrade cffi --no-binary cffi
+          pip3 install --upgrade -r requirements.txt
+
+          PYINSTALLER_COMPILE_BOOTLOADER=1 pip3 install --upgrade -r requirements.txt --no-binary pyinstaller
 
       - name: Build binary
-        run: poetry run pyinstaller cook-import.spec
+        run: pyinstaller cook-import.spec
+
+      - name: Import macOS codesign certificates
+        uses: apple-actions/import-codesign-certs@v1
+        if: env.SIGNING_AUTH
+        with:
+          p12-file-base64: ${{ secrets.CERTIFICATES_P12 }}
+          p12-password: ${{ secrets.CERTIFICATES_P12_PASSWORD }}
+      - name: Upload macOS binary
+        uses: actions/upload-artifact@v2
+        with:
+          path: "*-osx.dmg"
+          name: macOS binary (not notarized)
+      - name: Prepare official release
+        if: env.AUTOMATION_GITHUB_TOKEN && startsWith(github.ref, 'refs/tags/')
+        run: python3 builder/package.py release
